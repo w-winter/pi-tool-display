@@ -1,6 +1,6 @@
 {
   "name": "pi-tool-display",
-  "version": "0.1.7",
+  "version": "0.1.10",
   "description": "OpenCode-style tool call/result rendering extension for Pi coding agent.",
   "type": "module",
   "main": "./index.ts",
@@ -19,7 +19,7 @@
   "scripts": {
     "build": "npx --yes -p typescript@5.7.3 tsc -p tsconfig.json --noCheck",
     "lint": "npm run build",
-    "test": "node --test",
+    "test": "npx --yes tsx --test tests/*.test.ts",
     "check": "npm run lint && npm run test"
   },
   "keywords": [
@@ -54,5 +54,8 @@
   "peerDependencies": {
     "@mariozechner/pi-coding-agent": "*",
     "@mariozechner/pi-tui": "*"
+  },
+  "overrides": {
+    "file-type": ">=21.3.1"
   }
 }

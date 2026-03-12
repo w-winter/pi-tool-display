@@ -5,6 +5,12 @@ import {
 	clampRenderedLineToWidth,
 	clampRenderedLinesToWidth,
 } from "./line-width-safety.js";
+import {
+	buildDiffSummaryText,
+	normalizeDiffRenderWidth,
+	resolveDiffPresentationMode,
+	type DiffPresentationMode,
+} from "./diff-presentation.js";
 import { pluralize, sanitizeAnsiForThemedOutput } from "./render-utils.js";
 import type { ToolDisplayConfig } from "./types.js";
 
@@ -233,12 +239,6 @@ function stabilizeBackgroundResets(text: string): string {
 		}
 		return `\x1b[${sanitized.join(";")}m`;
 	});
-}
-
-function padToWidth(text: string, width: number): string {
-	const trimmed = truncateToWidth(text, width);
-	const gap = Math.max(0, width - visibleWidth(trimmed));
-	return gap > 0 ? `${trimmed}${" ".repeat(gap)}` : trimmed;
 }
 
 function fitToWidth(text: string, width: number): string {
@@ -1185,6 +1185,59 @@ function renderLinePrefix(
 	return `${marker}${spacer}${number}${spacer}`;
 }
 
+function renderCompactMarker(kind: DiffLineKind, theme: DiffTheme, rowBg: string | undefined): string {
+	if (kind === "add") {
+		return colorizeSegment(theme, "toolDiffAdded", "+", rowBg);
+	}
+	if (kind === "remove") {
+		return colorizeSegment(theme, "toolDiffRemoved", "-", rowBg);
+	}
+	return colorizeSegment(theme, "dim", "·", rowBg);
+}
+
+function renderCompactLinePrefix(kind: DiffLineKind, theme: DiffTheme, rowBg: string | undefined): string {
+	const marker = renderCompactMarker(kind, theme, rowBg);
+	const spacer = rowBg ? `${rowBg} ` : " ";
+	return `${marker}${spacer}`;
+}
+
+function renderCompactContinuationPrefix(rowBg: string | undefined): string {
+	return rowBg ? `${rowBg}  ` : "  ";
+}
+
+function renderCompactLineCell(
+	kind: DiffLineKind,
+	code: string,
+	width: number,
+	rowBg: string | undefined,
+	restoreBgAnsi: string | undefined,
+	theme: DiffTheme,
+	wordWrap: boolean,
+): string[] {
+	if (width <= 0) {
+		return [""];
+	}
+
+	const prefix = renderCompactLinePrefix(kind, theme, rowBg);
+	const continuationPrefix = renderCompactContinuationPrefix(rowBg);
+	const prefixPlainWidth = 2;
+	const codeWidth = Math.max(0, width - prefixPlainWidth);
+	const wrappedCodeLines = wrapToWidth(code, codeWidth, wordWrap);
+
+	if (!rowBg) {
+		return wrappedCodeLines.map((wrappedCodeLine, index) =>
+			stabilizeBackgroundResets(`${index === 0 ? prefix : continuationPrefix}${wrappedCodeLine}`)
+		);
+	}
+
+	const safeRestoreBgAnsi = restoreBgAnsi ?? rowBg ?? ANSI_BG_RESET;
+	return wrappedCodeLines.map((wrappedCodeLine, index) => {
+		const safeWrappedCodeLine = keepBackgroundAcrossResets(wrappedCodeLine, rowBg);
+		const linePrefix = index === 0 ? prefix : continuationPrefix;
+		return stabilizeBackgroundResets(`${linePrefix}${rowBg}${safeWrappedCodeLine}${safeRestoreBgAnsi}`);
+	});
+}
+
 function renderLineCell(
 	kind: DiffLineKind,
 	lineNumber: string,
@@ -1288,6 +1341,43 @@ function toUnifiedFallbackRows(
 		}
 	}
 	return renderUnified(flattened, width, theme, lineNumberWidth, inlineHighlights, palette, highlightLine, containerBgAnsi, wordWrap);
+}
+
+function renderCompact(
+	entries: ParsedDiffEntry[],
+	width: number,
+	theme: DiffTheme,
+	inlineHighlights: WeakMap<DiffLineEntry, DiffSpan[]>,
+	palette: DiffPalette,
+	highlightLine: CodeLineHighlighter,
+	containerBgAnsi: string | undefined,
+	wordWrap: boolean,
+): RenderedRow[] {
+	const rows: RenderedRow[] = [];
+
+	for (const entry of entries) {
+		if (entry.kind !== "line") {
+			rows.push(...formatMetaEntryRows(entry, width, theme, wordWrap));
+			continue;
+		}
+
+		const codeText = normalizeCodeWhitespace(entry.content);
+		const syntaxHighlighted = highlightLine(codeText);
+		const rowBg = getLineRowBackground(entry.lineKind, palette);
+		const emphasisBg = getLineEmphasisBackground(entry.lineKind, palette);
+		const inlineSpans = inlineHighlights.get(entry) ?? [];
+		const highlighted = applyInlineSpanHighlight(codeText, syntaxHighlighted, inlineSpans, emphasisBg, rowBg, containerBgAnsi);
+		const lines = renderCompactLineCell(entry.lineKind, highlighted, width, rowBg, containerBgAnsi, theme, wordWrap);
+
+		rows.push(
+			...lines.map((text) => ({
+				text,
+				hunkIndex: entry.hunkIndex || null,
+			})),
+		);
+	}
+
+	return rows;
 }
 
 function renderSplitBlankCell(columnWidth: number, lineNumberWidth: number, theme: DiffTheme): string {
@@ -1459,7 +1549,16 @@ function renderDiffStatBar(stats: DiffStats, width: number, theme: DiffTheme): s
 	return stabilizeBackgroundResets(`${theme.fg("dim", "[")}${addedBar}${removedBar}${theme.fg("dim", "]")}`);
 }
 
-function renderHeaderRows(stats: DiffStats, mode: "split" | "unified", width: number, theme: DiffTheme): RenderedRow[] {
+function renderHeaderRows(stats: DiffStats, mode: Exclude<DiffPresentationMode, "summary">, width: number, theme: DiffTheme): RenderedRow[] {
+	if (mode === "compact") {
+		const summary = [
+			theme.fg("toolOutput", `↳ ${emphasis(theme, "diff")}`),
+			theme.fg("toolDiffAdded", `+${stats.added}`),
+			theme.fg("toolDiffRemoved", `-${stats.removed}`),
+		].join(" ");
+		return [{ text: stabilizeBackgroundResets(truncateToWidth(summary, width)), hunkIndex: null }];
+	}
+
 	const summaryPieces = mode === "split"
 		? [
 			theme.fg("toolOutput", `↳ ${emphasis(theme, "diff")}`),
@@ -1541,23 +1640,67 @@ function applyLineLimit(
 	];
 }
 
-function shouldUseSplitMode(config: ToolDisplayConfig, width: number): boolean {
-	switch (config.diffViewMode) {
-		case "split":
-			return true;
-		case "unified":
-			return false;
-		case "auto":
-		default:
-			return width >= config.diffSplitMinWidth;
+function collectDiffStats(entries: ParsedDiffEntry[], fallbackHunks = 0, fallbackFiles = 0): DiffStats {
+	const stats: DiffStats = {
+		added: 0,
+		removed: 0,
+		context: 0,
+		hunks: fallbackHunks,
+		files: fallbackFiles,
+		lines: entries.length,
+	};
+
+	const hunkIndexes = new Set<number>();
+	let explicitFileCount = 0;
+
+	for (const entry of entries) {
+		if (entry.kind === "line") {
+			if (entry.lineKind === "add") {
+				stats.added++;
+			} else if (entry.lineKind === "remove") {
+				stats.removed++;
+			} else {
+				stats.context++;
+			}
+			if (entry.hunkIndex > 0) {
+				hunkIndexes.add(entry.hunkIndex);
+			}
+			continue;
+		}
+
+		if (entry.kind === "hunk" && entry.hunkIndex > 0) {
+			hunkIndexes.add(entry.hunkIndex);
+		}
+		if (entry.kind === "file") {
+			explicitFileCount++;
+		}
 	}
+
+	if (hunkIndexes.size > 0) {
+		stats.hunks = Math.max(stats.hunks, hunkIndexes.size);
+	}
+	if (explicitFileCount > 0) {
+		stats.files = Math.max(stats.files, explicitFileCount);
+	} else if (entries.length > 0) {
+		stats.files = Math.max(stats.files, 1);
+	}
+	if (stats.hunks === 0 && entries.some((entry) => entry.kind === "line")) {
+		stats.hunks = 1;
+	}
+
+	return stats;
 }
 
-function resolveRenderWidth(width: number): number {
-	const stdoutWidth = process.stdout?.columns;
-	const terminalWidth = typeof stdoutWidth === "number" && stdoutWidth > 0 ? stdoutWidth : DEFAULT_RENDER_WIDTH;
-	const targetWidth = width > 0 ? width : terminalWidth;
-	return Math.max(28, targetWidth);
+function renderSummaryRows(stats: DiffStats, width: number, theme: DiffTheme): string[] {
+	if (width <= 0) {
+		return [""];
+	}
+	return [
+		clampDiffLineToWidth(
+			stabilizeBackgroundResets(theme.fg("toolOutput", buildDiffSummaryText(stats, width))),
+			width,
+		),
+	];
 }
 
 function safeGetDiff(details: unknown): string {
@@ -1606,22 +1749,27 @@ export function renderEditDiffResult(
 
 	let cachedWidth: number | undefined;
 	let cachedExpanded: boolean | undefined;
-	let cachedMode: "split" | "unified" | undefined;
+	let cachedMode: DiffPresentationMode | undefined;
 	let cachedLines: string[] | undefined;
 
 	return {
 		render(width: number): string[] {
-			const safeWidth = resolveRenderWidth(width);
-			const preferredMode: "split" | "unified" = shouldUseSplitMode(config, safeWidth) ? "split" : "unified";
-			const mode: "split" | "unified" = preferredMode === "split" && canRenderSplitLayout(safeWidth)
-				? "split"
-				: "unified";
+			const safeWidth = normalizeDiffRenderWidth(width);
+			const mode = resolveDiffPresentationMode(config, safeWidth, canRenderSplitLayout(safeWidth));
 			if (
 				cachedLines
 				&& cachedWidth === safeWidth
 				&& cachedExpanded === options.expanded
 				&& cachedMode === mode
 			) {
+				return cachedLines;
+			}
+
+			if (mode === "summary") {
+				cachedLines = renderSummaryRows(parsed.stats, safeWidth, theme);
+				cachedWidth = safeWidth;
+				cachedExpanded = options.expanded;
+				cachedMode = mode;
 				return cachedLines;
 			}
 
@@ -1638,17 +1786,28 @@ export function renderEditDiffResult(
 					containerBgAnsi,
 					wordWrap,
 				)
-				: renderUnified(
-					parsed.entries,
-					safeWidth,
-					theme,
-					lineNumberWidth,
-					inlineHighlights,
-					palette,
-					highlightLine,
-					containerBgAnsi,
-					wordWrap,
-				);
+				: mode === "compact"
+					? renderCompact(
+						parsed.entries,
+						safeWidth,
+						theme,
+						inlineHighlights,
+						palette,
+						highlightLine,
+						containerBgAnsi,
+						wordWrap,
+					)
+					: renderUnified(
+						parsed.entries,
+						safeWidth,
+						theme,
+						lineNumberWidth,
+						inlineHighlights,
+						palette,
+						highlightLine,
+						containerBgAnsi,
+						wordWrap,
+					);
 			const bodyWithLimit = applyLineLimit(
 				bodyRows,
 				safeWidth,
@@ -1658,13 +1817,11 @@ export function renderEditDiffResult(
 				theme,
 			);
 			const frame = renderDiffFrameLine(safeWidth, theme);
+			const renderedLines = mode === "unified"
+				? [...headerRows.map((row) => row.text), frame, ...bodyWithLimit, frame]
+				: [...headerRows.map((row) => row.text), ...bodyWithLimit];
 
-			cachedLines = clampDiffLinesToWidth(
-				mode === "split"
-					? [...headerRows.map((row) => row.text), ...bodyWithLimit]
-					: [...headerRows.map((row) => row.text), frame, ...bodyWithLimit, frame],
-				safeWidth,
-			);
+			cachedLines = clampDiffLinesToWidth(renderedLines, safeWidth);
 			cachedWidth = safeWidth;
 			cachedExpanded = options.expanded;
 			cachedMode = mode;
@@ -1828,6 +1985,111 @@ function buildWriteOverwriteEntries(oldLines: string[], newLines: string[]): Par
 	return entries;
 }
 
+interface WriteDiffData {
+	entries: ParsedDiffEntry[];
+	splitRows: SplitDiffRow[];
+	inlineHighlights: WeakMap<DiffLineEntry, DiffSpan[]>;
+	lineNumberWidth: number;
+	stats: DiffStats;
+	hunkCount: number;
+}
+
+interface WriteOverwriteGuard {
+	previousLineCount: number;
+	nextLineCount: number;
+}
+
+const MAX_WRITE_OVERWRITE_DIFF_LINES = 4000;
+const MAX_WRITE_OVERWRITE_DIFF_MATRIX_CELLS = 1_000_000;
+
+function buildApproximateWriteStats(
+	lineCount: number,
+	previousLineCount: number,
+	hasComparablePrevious: boolean,
+): DiffStats {
+	const removed = hasComparablePrevious ? previousLineCount : 0;
+	const added = lineCount;
+	const hasContent = lineCount > 0 || removed > 0;
+	return {
+		added,
+		removed,
+		context: 0,
+		hunks: hasContent ? 1 : 0,
+		files: 1,
+		lines: added + removed,
+	};
+}
+
+function buildWriteDiffData(entries: ParsedDiffEntry[]): WriteDiffData {
+	const splitRows = buildSplitRows(entries);
+	const inlineHighlights = buildInlineHighlightMap(splitRows);
+	const lineNumberWidth = getLineNumberWidth(entries);
+	const hunkCount = entries.length > 0 ? 1 : 0;
+	const stats = collectDiffStats(entries, hunkCount, 1);
+	return {
+		entries,
+		splitRows,
+		inlineHighlights,
+		lineNumberWidth,
+		stats,
+		hunkCount,
+	};
+}
+
+function resolveWriteOverwriteGuard(
+	previousLines: string[],
+	nextLines: string[],
+): WriteOverwriteGuard | undefined {
+	const previousLineCount = previousLines.length;
+	const nextLineCount = nextLines.length;
+	if (previousLineCount > MAX_WRITE_OVERWRITE_DIFF_LINES || nextLineCount > MAX_WRITE_OVERWRITE_DIFF_LINES) {
+		return { previousLineCount, nextLineCount };
+	}
+	if (previousLineCount === 0 || nextLineCount === 0) {
+		return undefined;
+	}
+	return previousLineCount * nextLineCount > MAX_WRITE_OVERWRITE_DIFF_MATRIX_CELLS
+		? { previousLineCount, nextLineCount }
+		: undefined;
+}
+
+function buildWriteOverwriteGuardText(guard: WriteOverwriteGuard, width: number): string {
+	const safeWidth = normalizeDiffRenderWidth(width);
+	if (safeWidth === 0) {
+		return "";
+	}
+
+	const candidates = [
+		`↳ overwrite diff omitted (${guard.previousLineCount} → ${guard.nextLineCount} lines)`,
+		`↳ overwrite diff omitted (${guard.previousLineCount}→${guard.nextLineCount})`,
+		"↳ overwrite diff omitted",
+		"diff omitted",
+		"…",
+	];
+	for (const candidate of candidates) {
+		if (visibleWidth(candidate) <= safeWidth) {
+			return candidate;
+		}
+	}
+	return truncateToWidth(candidates[candidates.length - 1] ?? "", safeWidth, "");
+}
+
+function renderWriteOverwriteGuardRows(
+	guard: WriteOverwriteGuard,
+	width: number,
+	theme: DiffTheme,
+): string[] {
+	if (width <= 0) {
+		return [""];
+	}
+	return [
+		clampDiffLineToWidth(
+			stabilizeBackgroundResets(theme.fg("warning", buildWriteOverwriteGuardText(guard, width))),
+			width,
+		),
+	];
+}
+
 export function renderWriteDiffResult(
 	content: string | undefined,
 	options: DiffRenderOptions,
@@ -1848,12 +2110,14 @@ export function renderWriteDiffResult(
 		? splitWriteContentLines(options.previousContent)
 		: [];
 	const hasComparablePrevious = options.fileExistedBeforeWrite === true && typeof options.previousContent === "string";
-	const entries = hasComparablePrevious
-		? buildWriteOverwriteEntries(previousLines, lines)
-		: buildWriteEntries(lines);
-	const splitRows = buildSplitRows(entries);
-	const inlineHighlights = buildInlineHighlightMap(splitRows);
-	const lineNumberWidth = getLineNumberWidth(entries);
+	const approximateStats = buildApproximateWriteStats(
+		lines.length,
+		previousLines.length,
+		hasComparablePrevious,
+	);
+	const overwriteGuard = hasComparablePrevious
+		? resolveWriteOverwriteGuard(previousLines, lines)
+		: undefined;
 	const palette = resolveDiffPalette(theme, {
 		addRowBgMixRatio: config.writeAddedLineBgMixRatio,
 	});
@@ -1861,21 +2125,33 @@ export function renderWriteDiffResult(
 	const language = resolveLanguageFromPath(filePath);
 	const highlightLine = createCodeLineHighlighter(language);
 	const wordWrap = config.diffWordWrap;
-	const hunkCount = entries.length > 0 ? 1 : 0;
 
+	let detailedData: WriteDiffData | undefined;
 	let cachedWidth: number | undefined;
 	let cachedExpanded: boolean | undefined;
-	let cachedMode: "split" | "unified" | undefined;
+	let cachedMode: DiffPresentationMode | undefined;
 	let cachedLines: string[] | undefined;
+
+	function getDetailedData(): WriteDiffData {
+		if (detailedData) {
+			return detailedData;
+		}
+		const entries = hasComparablePrevious
+			? buildWriteOverwriteEntries(previousLines, lines)
+			: buildWriteEntries(lines);
+		detailedData = buildWriteDiffData(entries);
+		return detailedData;
+	}
 
 	return {
 		render(width: number): string[] {
-			const safeWidth = resolveRenderWidth(width);
-			const preferredMode: "split" | "unified" = shouldUseSplitMode(config, safeWidth) ? "split" : "unified";
-			const adaptiveMode: "split" | "unified" = preferredMode === "split" && canRenderSplitLayout(safeWidth)
-				? "split"
-				: "unified";
-			const mode: "split" | "unified" = hasComparablePrevious ? adaptiveMode : "unified";
+			const safeWidth = normalizeDiffRenderWidth(width);
+			const resolvedMode = resolveDiffPresentationMode(config, safeWidth, canRenderSplitLayout(safeWidth));
+			const mode: DiffPresentationMode = hasComparablePrevious
+				? resolvedMode
+				: resolvedMode === "split"
+					? "unified"
+					: resolvedMode;
 			if (
 				cachedLines
 				&& cachedWidth === safeWidth
@@ -1890,47 +2166,79 @@ export function renderWriteDiffResult(
 				safeWidth,
 				theme,
 			);
-			const bodyRows: RenderedRow[] = entries.length === 0
+			if (overwriteGuard) {
+				cachedLines = clampDiffLinesToWidth(
+					[header, ...renderWriteOverwriteGuardRows(overwriteGuard, safeWidth, theme)],
+					safeWidth,
+				);
+				cachedWidth = safeWidth;
+				cachedExpanded = options.expanded;
+				cachedMode = mode;
+				return cachedLines;
+			}
+
+			if (mode === "summary") {
+				const summaryRows = approximateStats.lines === 0
+					? [header]
+					: [header, ...renderSummaryRows(approximateStats, safeWidth, theme)];
+				cachedLines = clampDiffLinesToWidth(summaryRows, safeWidth);
+				cachedWidth = safeWidth;
+				cachedExpanded = options.expanded;
+				cachedMode = mode;
+				return cachedLines;
+			}
+
+			const data = getDetailedData();
+			const bodyRows: RenderedRow[] = data.entries.length === 0
 				? [{ text: theme.fg("muted", "(empty file)"), hunkIndex: null }]
 				: mode === "split"
 					? renderSplit(
-						splitRows,
+						data.splitRows,
 						safeWidth,
 						theme,
-						lineNumberWidth,
-						inlineHighlights,
+						data.lineNumberWidth,
+						data.inlineHighlights,
 						palette,
 						highlightLine,
 						containerBgAnsi,
 						wordWrap,
 					)
-					: renderUnified(
-						entries,
-						safeWidth,
-						theme,
-						lineNumberWidth,
-						inlineHighlights,
-						palette,
-						highlightLine,
-						containerBgAnsi,
-						wordWrap,
-					);
+					: mode === "compact"
+						? renderCompact(
+							data.entries,
+							safeWidth,
+							theme,
+							data.inlineHighlights,
+							palette,
+							highlightLine,
+							containerBgAnsi,
+							wordWrap,
+						)
+						: renderUnified(
+							data.entries,
+							safeWidth,
+							theme,
+							data.lineNumberWidth,
+							data.inlineHighlights,
+							palette,
+							highlightLine,
+							containerBgAnsi,
+							wordWrap,
+						);
 
 			const bodyWithLimit = applyLineLimit(
 				bodyRows,
 				safeWidth,
 				options.expanded,
 				config.diffCollapsedLines,
-				hunkCount,
+				data.hunkCount,
 				theme,
 			);
 			const frame = renderDiffFrameLine(safeWidth, theme);
-			cachedLines = clampDiffLinesToWidth(
-				mode === "split"
-					? [header, ...bodyWithLimit]
-					: [header, frame, ...bodyWithLimit, frame],
-				safeWidth,
-			);
+			const renderedLines = mode === "unified"
+				? [header, frame, ...bodyWithLimit, frame]
+				: [header, ...bodyWithLimit];
+			cachedLines = clampDiffLinesToWidth(renderedLines, safeWidth);
 			cachedWidth = safeWidth;
 			cachedExpanded = options.expanded;
 			cachedMode = mode;
