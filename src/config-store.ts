@@ -31,6 +31,15 @@ function clampNumber(value: unknown, min: number, max: number, fallback: number)
 	return rounded;
 }
 
+function clampRatio(value: unknown, fallback: number): number {
+	if (typeof value !== "number" || Number.isNaN(value)) {
+		return fallback;
+	}
+	if (value < 0) return 0;
+	if (value > 1) return 1;
+	return value;
+}
+
 function toBoolean(value: unknown, fallback: boolean): boolean {
 	return typeof value === "boolean" ? value : fallback;
 }
@@ -123,6 +132,10 @@ export function normalizeToolDisplayConfig(raw: unknown): ToolDisplayConfig {
 		diffSplitMinWidth: clampNumber(source.diffSplitMinWidth, 70, 240, DEFAULT_TOOL_DISPLAY_CONFIG.diffSplitMinWidth),
 		diffCollapsedLines: clampNumber(source.diffCollapsedLines, 4, 240, DEFAULT_TOOL_DISPLAY_CONFIG.diffCollapsedLines),
 		diffWordWrap: toBoolean(source.diffWordWrap, DEFAULT_TOOL_DISPLAY_CONFIG.diffWordWrap),
+		writeAddedLineBgMixRatio: clampRatio(
+			source.writeAddedLineBgMixRatio,
+			DEFAULT_TOOL_DISPLAY_CONFIG.writeAddedLineBgMixRatio,
+		),
 		showTruncationHints: toBoolean(source.showTruncationHints, DEFAULT_TOOL_DISPLAY_CONFIG.showTruncationHints),
 		showRtkCompactionHints: toBoolean(
 			source.showRtkCompactionHints,

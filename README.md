@@ -120,6 +120,7 @@ A starter template is included at `config/config.example.json`.
 | `diffSplitMinWidth` | number | `120` | Minimum width before auto mode prefers split diffs |
 | `diffCollapsedLines` | number | `24` | Diff lines shown before collapsing |
 | `diffWordWrap` | boolean | `true` | Wrap long diff lines when needed |
+| `writeAddedLineBgMixRatio` | number | `0.24` | Added-line background tint strength for write previews (`0` to `1`) |
 | `showTruncationHints` | boolean | `true` | Show truncation indicators for compacted output |
 | `showRtkCompactionHints` | boolean | `true` | Show RTK compaction hints when RTK metadata exists |
 
@@ -169,6 +170,7 @@ Set any entry to `false` if another extension should handle that tool instead.
   "diffSplitMinWidth": 120,
   "diffCollapsedLines": 24,
   "diffWordWrap": true,
+  "writeAddedLineBgMixRatio": 0.24,
   "showTruncationHints": true,
   "showRtkCompactionHints": true
 }

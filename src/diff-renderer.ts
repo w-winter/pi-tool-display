@@ -98,13 +98,15 @@ const MIN_LINE_NUMBER_WIDTH = 2;
 const MIN_SPLIT_COLUMN_WIDTH = 24;
 const MAX_INLINE_DIFF_LINE_LENGTH = 700;
 const DEFAULT_RENDER_WIDTH = 120;
-const ADD_ROW_BACKGROUND_MIX_RATIO = 0.24;
-const REMOVE_ROW_BACKGROUND_MIX_RATIO = 0.12;
-const ADD_INLINE_EMPHASIS_MIX_RATIO = 0.44;
-const REMOVE_INLINE_EMPHASIS_MIX_RATIO = 0.26;
+const DEFAULT_ADD_ROW_BACKGROUND_MIX_RATIO = 0.24;
+const DEFAULT_REMOVE_ROW_BACKGROUND_MIX_RATIO = 0.12;
+const ADD_INLINE_EMPHASIS_MIX_RATIO = 0.54;
+const REMOVE_INLINE_EMPHASIS_MIX_RATIO = 0.36;
 const ADDITION_TINT_TARGET: RgbColor = { r: 84, g: 190, b: 118 };
 const DELETION_TINT_TARGET: RgbColor = { r: 232, g: 95, b: 122 };
 const ANSI_BG_RESET = "\x1b[49m";
+const ANSI_BOLD_ON = "\x1b[1m";
+const ANSI_BOLD_OFF = "\x1b[22m";
 const ANSI_SGR_PATTERN = /\x1b\[([0-9;]*)m/g;
 const STYLE_RESET_PARAMS = [39, 22, 23, 24, 25, 27, 28, 29, 59] as const;
 const DIFF_WIDTH_OPS = {
@@ -141,7 +143,7 @@ function toSgrParams(rawParams: string): number[] {
 	return parsed.length > 0 ? parsed : [];
 }
 
-function sequenceAffectsBackground(params: number[]): boolean {
+function sequenceResetsBackground(params: number[]): boolean {
 	for (let index = 0; index < params.length; index++) {
 		const param = params[index] ?? 0;
 
@@ -149,21 +151,16 @@ function sequenceAffectsBackground(params: number[]): boolean {
 			return true;
 		}
 
-		if ((param >= 40 && param <= 47) || (param >= 100 && param <= 107)) {
-			return true;
-		}
-
 		if (param === 48) {
 			const colorMode = params[index + 1];
 			if (colorMode === 5) {
 				index += 2;
-				return true;
+				continue;
 			}
 			if (colorMode === 2) {
 				index += 4;
-				return true;
+				continue;
 			}
-			return true;
 		}
 	}
 
@@ -972,7 +969,10 @@ function resolveContainerBackgroundAnsi(theme: DiffTheme): string | undefined {
 		?? readThemeAnsi(theme, "bg", "userMessageBg");
 }
 
-function resolveDiffPalette(theme: DiffTheme): DiffPalette {
+function resolveDiffPalette(
+	theme: DiffTheme,
+	overrides?: { addRowBgMixRatio?: number; removeRowBgMixRatio?: number },
+): DiffPalette {
 	const baseBg = parseAnsiColorCode(readThemeAnsi(theme, "bg", "toolSuccessBg"))
 		?? parseAnsiColorCode(readThemeAnsi(theme, "bg", "toolPendingBg"))
 		?? parseAnsiColorCode(readThemeAnsi(theme, "bg", "userMessageBg"))
@@ -982,8 +982,10 @@ function resolveDiffPalette(theme: DiffTheme): DiffPalette {
 	const addTint = mixRgb(addFg, ADDITION_TINT_TARGET, 0.35);
 	const removeTint = mixRgb(removeFg, DELETION_TINT_TARGET, 0.65);
 
-	const addRowBg = mixRgb(baseBg, addTint, ADD_ROW_BACKGROUND_MIX_RATIO);
-	const removeRowBg = mixRgb(baseBg, removeTint, REMOVE_ROW_BACKGROUND_MIX_RATIO);
+	const addRowBgMixRatio = overrides?.addRowBgMixRatio ?? DEFAULT_ADD_ROW_BACKGROUND_MIX_RATIO;
+	const removeRowBgMixRatio = overrides?.removeRowBgMixRatio ?? DEFAULT_REMOVE_ROW_BACKGROUND_MIX_RATIO;
+	const addRowBg = mixRgb(baseBg, addTint, addRowBgMixRatio);
+	const removeRowBg = mixRgb(baseBg, removeTint, removeRowBgMixRatio);
 	const addEmphasisBg = mixRgb(baseBg, addTint, ADD_INLINE_EMPHASIS_MIX_RATIO);
 	const removeEmphasisBg = mixRgb(baseBg, removeTint, REMOVE_INLINE_EMPHASIS_MIX_RATIO);
 
@@ -1021,6 +1023,8 @@ function applyBackgroundToVisibleRange(
 	end: number,
 	backgroundAnsi: string,
 	restoreBackgroundAnsi: string,
+	startStyleAnsi: string = "",
+	endStyleAnsi: string = "",
 ): string {
 	if (!ansiText || start >= end || end <= 0) {
 		return ansiText;
@@ -1044,11 +1048,11 @@ function applyBackgroundToVisibleRange(
 		}
 
 		if (visibleIndex === rangeStart && !inRange) {
-			output += backgroundAnsi;
+			output += `${backgroundAnsi}${startStyleAnsi}`;
 			inRange = true;
 		}
 		if (visibleIndex === rangeEnd && inRange) {
-			output += restoreBackgroundAnsi;
+			output += `${endStyleAnsi}${restoreBackgroundAnsi}`;
 			inRange = false;
 		}
 
@@ -1058,7 +1062,7 @@ function applyBackgroundToVisibleRange(
 	}
 
 	if (inRange) {
-		output += restoreBackgroundAnsi;
+		output += `${endStyleAnsi}${restoreBackgroundAnsi}`;
 	}
 
 	return output;
@@ -1101,6 +1105,8 @@ function applyInlineSpanHighlight(
 			span.end,
 			emphasisBgAnsi,
 			restoreBackgroundAnsi,
+			ANSI_BOLD_ON,
+			ANSI_BOLD_OFF,
 		);
 	}
 
@@ -1135,7 +1141,7 @@ function keepBackgroundAcrossResets(text: string, rowBg: string): string {
 
 	return text.replace(ANSI_SGR_PATTERN, (sequence, rawParams: string) => {
 		const params = toSgrParams(rawParams);
-		if (params.length === 0 || !sequenceAffectsBackground(params)) {
+		if (params.length === 0 || !sequenceResetsBackground(params)) {
 			return sequence;
 		}
 		return `${sequence}${rowBg}`;
@@ -1848,7 +1854,9 @@ export function renderWriteDiffResult(
 	const splitRows = buildSplitRows(entries);
 	const inlineHighlights = buildInlineHighlightMap(splitRows);
 	const lineNumberWidth = getLineNumberWidth(entries);
-	const palette = resolveDiffPalette(theme);
+	const palette = resolveDiffPalette(theme, {
+		addRowBgMixRatio: config.writeAddedLineBgMixRatio,
+	});
 	const containerBgAnsi = resolveContainerBackgroundAnsi(theme);
 	const language = resolveLanguageFromPath(filePath);
 	const highlightLine = createCodeLineHighlighter(language);

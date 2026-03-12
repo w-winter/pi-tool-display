@@ -19,6 +19,7 @@
   "diffSplitMinWidth": 120,
   "diffCollapsedLines": 24,
   "diffWordWrap": true,
+  "writeAddedLineBgMixRatio": 0.24,
   "showTruncationHints": true,
   "showRtkCompactionHints": true
 }
